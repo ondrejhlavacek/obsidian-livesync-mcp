@@ -89,6 +89,66 @@ export OBSIDIAN_OBFUSCATE_PASSPHRASE="your-livesync-passphrase"
 
 The server supports two transports: **stdio** (default, for local clients) and **streamable-http** (for remote/networked access).
 
+### Task-only MCP
+
+This fork adds a task-only server mode for a single, existing Markdown note in the configured
+LiveSync database. Start a separate server instance from this fork and set `MCP_TASK_NOTE` to
+the exact vault-relative path, including its case and the `.md` suffix. The server exposes
+`get_task_snapshot`, `apply_task_command`, and `undo_completion`. General vault MCP tools
+and attachment routes are disabled in this mode.
+
+For native clients, use a TLS reverse proxy in front of the Streamable HTTP endpoint. Keep
+the CouchDB credentials and MCP token in server-side configuration. Set `MCP_API_KEY` from
+your secret store, or configure OIDC as described below. Clients authenticate to
+`https://tasks.example.com/mcp` using their MCP credential.
+
+```bash
+export MCP_TASK_NOTE="Lists/Tasks.md"
+export MCP_TRANSPORT="streamable-http"
+export MCP_HOST="127.0.0.1"
+export MCP_RESOURCE_URL="https://tasks.example.com"
+python -m obsidian_livesync_mcp.server
+```
+
+Configure the CouchDB environment variables above before starting the server. Task mode
+requires a plain-text LiveSync note using supported content-addressed chunks. Select Tasks'
+Dataview format in Obsidian. If the vault's Tasks global filter requires a tag, include that
+tag in new task titles. Existing leading and trailing tags, including those interleaved
+with fields, are preserved when a task is renamed. The only supported completion recurrence
+is `every month on the 23rd` with a compatible due date and no additional scheduling behavior
+or nested content. Tasks with indeterminate list boundaries require editing in Obsidian.
+
+#### Commands, replay and conflicts
+
+Read a snapshot and persist the full desired-state command before sending it. Keep its UUID,
+base revision, expected state, and original timezone-aware action timestamp unchanged on retry.
+Use the snapshot task ID when available. A locator for a task without an ID is valid only at
+its exact snapshot revision. The tool's input schema lists the command shapes and snapshot
+capabilities indicate which operations a task accepts.
+
+A successful response gives `applied` or `already_applied`, the original accepted revision,
+and affected tasks as visible in the latest verified snapshot. The server records replay
+receipts in the same CouchDB parent write as the task edit. An ordinary Obsidian LiveSync
+write can remove these receipts, and CouchDB can prune old revision ancestry. When replay
+cannot prove the outcome, a stale command returns a conflict with `details.outcome` set
+to `unknown`. Keep the original command pending for reconciliation or user review. Reusing
+its intent with a new UUID or a changed base revision can apply a second edit.
+
+The server checks for siblings before and after publication. A pre-existing sibling blocks the
+write. If a sibling reaches CouchDB between the final check and the revision-guarded write,
+CouchDB can accept the command on one branch while retaining the sibling. In that case the
+tool returns `replication_conflict` with `details.accepted_revision` and `details.outcome`
+set to `unknown`. The accepted revision identifies the branch that received the command.
+Preserve that information while resolving the conflict in Obsidian, then fetch a fresh
+snapshot and reconcile the original command. A transport interruption can also leave the
+outcome unknown. MCP errors use `isError` and a structured error code.
+
+Undo requires the original completion receipt and the completed occurrence and successor
+guards from its response. Use the current snapshot revision for the inverse. For stable IDs,
+intervening task-server edits may coexist with Undo if the revision chain proves that neither
+occurrence nor its surrounding task context changed. Undo for tasks without an ID requires
+the original completion revision. Missing history or a changed occurrence requires user review.
+
 ### Stdio (Claude Desktop / Claude Code)
 
 Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`) or Claude Code settings (`.claude/settings.json`):

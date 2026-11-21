@@ -9,6 +9,8 @@ from datetime import date, datetime
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from markdown_it import MarkdownIt
+
 FIELD_ORDER = (
     "id",
     "dependsOn",
@@ -42,13 +44,11 @@ TASK = re.compile(
     r"^(?P<indent>[ \t]*)(?P<quote>(?:>[ \t]*)*)"
     r"(?P<marker>[-*+]|[0-9]+[.)])[ \t]+\[(?P<status>[^\n])\](?P<body>.*)$"
 )
-LIST_ITEM = re.compile(r"^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+")
-QUOTE = re.compile(r"^[ \t]*(?:>[ \t]*)+")
-HTML_LITERAL = re.compile(r"<(pre|script|style|textarea)(?:[ \t>]|$)", re.IGNORECASE)
 HEADING = re.compile(r"^ {0,3}(?P<marker>#{1,6})(?:[ \t]+|$)(?P<title>.*)$")
-FENCE = re.compile(r"^(`{3,}|~{3,})(.*)$")
+MARKDOWN = MarkdownIt("commonmark")
 BLOCK_LINK = re.compile(r"[ \t]+\^[a-zA-Z0-9-]+$")
-TAG = re.compile(r"[ \t]+#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t]+$")
+TRAILING_TAG = re.compile(r"[ \t]+#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t`]+$")
+LEADING_TAGS = re.compile(r"([ \t]+#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t`]+)+[ \t]+")
 LINE_BREAK = re.compile(r"\r\n|\n|\r")
 END_LINE = re.compile(r"(?:\r\n|\n|\r)$")
 ID_VALUE = {
@@ -216,6 +216,7 @@ class Task:
     descendant_count: int = 0
     ambiguous_descendant: bool = False
     unsupported_descendant: bool = False
+    uncertain_block: bool = False
     note_lines: list[int] = field(default_factory=list)
     block: str = ""
     notes: str = ""
@@ -242,6 +243,7 @@ class Task:
             and due < "9999-12-23"
             and not any(name in self.fields for name in ("start", "scheduled", "onCompletion"))
             and self.end == self.line + 1
+            and not self.uncertain_block
             and not self.issues
         )
 
@@ -259,9 +261,9 @@ class Task:
             "set_completion": recurring_edit and "onCompletion" not in self.fields,
             "set_priority": editable,
             "edit_title": editable,
-            "edit_notes": editable,
+            "edit_notes": editable and not self.uncertain_block,
             "edit_due": recurring_edit,
-            "move": editable and not self.ambiguous_descendant,
+            "move": editable and not (self.ambiguous_descendant or self.uncertain_block),
             "delete": recurring_edit
             and not (self.ambiguous_descendant or self.unsupported_descendant),
             "assign_id": editable and self.id is None,
@@ -271,6 +273,8 @@ class Task:
         issues = list(self.issues)
         if self.unsupported_recurrence:
             issues.append(RECURRENCE_MESSAGE)
+        if self.uncertain_block:
+            issues.append("Edit this task's ambiguous Markdown list block in Obsidian.")
         if self.ambiguous_descendant:
             issues.append(
                 "Resolve duplicate descendant Tasks IDs before moving or deleting this task."
@@ -330,7 +334,7 @@ def parse_suffix(header: str, body_start: int) -> tuple[int, int, dict[str, Fiel
     while tail > body_start:
         match = FIELD.search(header, body_start, tail)
         if match is None:
-            tag = TAG.search(header, body_start, tail)
+            tag = TRAILING_TAG.search(header, body_start, tail)
             if tag:
                 tail = tag.start()
                 continue
@@ -344,7 +348,6 @@ def parse_suffix(header: str, body_start: int) -> tuple[int, int, dict[str, Fiel
         tail = match.start()
     if FIELD_LIKE.search(header, body_start, tail):
         issues.append("Malformed or misplaced Tasks metadata.")
-    tail = min((item.start for item in fields.values()), default=suffix_end)
     for key, field_value in fields.items():
         if key in DATE_FIELDS:
             try:
@@ -369,6 +372,10 @@ def read_task(
     body_start = matched.start("body")
     tail, suffix_end, fields, issues = parse_suffix(raw, body_start)
     title = raw[body_start:tail]
+    leading_tags = LEADING_TAGS.match(title)
+    if leading_tags:
+        body_start += leading_tags.end()
+        title = title[leading_tags.end() :]
     if matched.group("status") not in {" ", "x", "X"} or matched.group("quote"):
         issues.append("This Markdown checkbox form is read-only.")
     if not title.strip():
@@ -448,6 +455,7 @@ class TaskDocument:
                 task.parent.ambiguous_descendant |= (
                     task.ambiguous_descendant or "Duplicate Tasks ID." in task.issues
                 )
+                task.parent.uncertain_block |= task.uncertain_block
                 task.parent.unsupported_descendant |= (
                     task.unsupported_descendant or task.unsupported_recurrence
                 )
@@ -455,79 +463,90 @@ class TaskDocument:
         for section in self.sections:
             section.ambiguous = counts[section.id] > 1
 
+    def _source_tokens(self):
+        source = "".join(self.lines[self.start :])
+        tokens = MARKDOWN.parse(source)
+        if "%%" not in source:
+            return tokens
+        literal_lines = {
+            line
+            for token in tokens
+            if token.type in {"fence", "code_block", "html_block"} and token.map
+            for line in range(*token.map)
+        }
+        masked = self.lines[self.start :]
+        comment = False
+        for index, line in enumerate(masked):
+            body = line.lstrip(" \t")
+            if comment:
+                masked[index] = eol(line)
+                comment = "%%" not in body
+            elif body.startswith("%%") and index not in literal_lines:
+                masked[index] = eol(line)
+                comment = "%%" not in body[2:]
+        return MARKDOWN.parse("".join(masked))
+
     def _parse(self):
-        parents: list[Task] = []
-        list_context: list[tuple[int, int]] = []
+        items: dict[int, tuple[int, int | None]] = {}
+        heading_lines = set()
+        item_stack: list[int] = []
+        for token in self._source_tokens():
+            if token.type == "list_item_open" and token.map:
+                start, end = (position + self.start for position in token.map)
+                items.setdefault(start, (end, item_stack[-1] if item_stack else None))
+                item_stack.append(start)
+            elif token.type == "list_item_close":
+                item_stack.pop()
+            elif token.type == "heading_open" and token.level == 0 and token.map:
+                heading_lines.add(token.map[0] + self.start)
+
+        active: list[Task] = []
+        parsed: dict[int, Task] = {}
         headings: list[tuple[int, str]] = []
         section = self.sections[0]
-        fence = ""
-        protected_end = ""
-        protected_indent = 0
-        protected_quote = 0
         for index in range(self.start, len(self.lines)):
             raw = without_eol(self.lines[index])
+            if not raw.strip():
+                continue
             indent = indentation(raw)
-            if raw.strip():
-                while parents and indent <= parents[-1].indent:
-                    parents.pop()
-                while list_context and indent <= list_context[-1][0]:
-                    list_context.pop()
-                for parent in parents:
-                    parent.end = index + 1
-            quote = QUOTE.match(raw)
-            quote_depth = quote[0].count(">") if quote else 0
-            body = raw[quote.end() :] if quote else raw.lstrip(" \t")
-            if body and (indent < protected_indent or quote_depth < protected_quote):
-                fence = protected_end = ""
-            fence_line = FENCE.match(body)
-            in_indented_code = indent >= (list_context[-1][1] + 4 if list_context else 4)
-            html = HTML_LITERAL.match(body)
-            if fence:
-                if fence_line and fence_line[1].startswith(fence) and not fence_line[2].strip():
-                    fence = ""
-            elif protected_end:
-                if protected_end in body.lower():
-                    protected_end = ""
-            elif not in_indented_code and (fence_line or html or body.startswith(("<!--", "%%"))):
-                protected_indent = list_context[-1][1] if list_context else 0
-                protected_quote = quote_depth
-                if fence_line:
-                    fence = fence_line[1]
-                else:
-                    marker = (
-                        f"</{html[1].lower()}>"
-                        if html
-                        else "-->"
-                        if body.startswith("<!--")
-                        else "%%"
-                    )
-                    if marker not in body[2:].lower():
-                        protected_end = marker
-            else:
-                heading = HEADING.match(raw)
-                if heading and not parents:
-                    level = len(heading["marker"])
-                    title = re.sub(r"[ \t]+#+[ \t]*$", "", heading["title"]).strip()
-                    while headings and headings[-1][0] >= level:
-                        headings.pop()
-                    headings.append((level, title))
-                    key = digest(json.dumps(headings, ensure_ascii=False))
-                    section = Section(key, title, index, index + 1, level)
-                    self.sections.append(section)
-                    continue
-                matched = TASK.match(raw)
-                if matched and not in_indented_code:
-                    parent = parents[-1] if parents else None
-                    task = read_task(index, self.lines[index], matched, section, parent)
-                    self.tasks.append(task)
-                    parents.append(task)
-                    list_context.append((indent, task.note_indent))
-                    continue
-                list_item = LIST_ITEM.match(raw)
-                if list_item and not in_indented_code:
-                    list_context.append((indent, len(list_item[0].expandtabs(4))))
-            if parents and raw.strip():
-                parents[-1].note_lines.append(index)
+            while active and (
+                index >= items[active[-1].line][0] or indent < active[-1].note_indent
+            ):
+                task = active.pop()
+                if any(
+                    line.strip() and indentation(line) >= task.note_indent
+                    for line in self.lines[index : items[task.line][0]]
+                ):
+                    task.uncertain_block = True
+            for owner in active:
+                owner.end = index + 1
+
+            heading = HEADING.match(raw) if index in heading_lines else None
+            if heading:
+                level = len(heading["marker"])
+                title = re.sub(r"[ \t]+#+[ \t]*$", "", heading["title"]).strip()
+                while headings and headings[-1][0] >= level:
+                    headings.pop()
+                headings.append((level, title))
+                key = digest(json.dumps(headings, ensure_ascii=False))
+                section = Section(key, title, index, index + 1, level)
+                self.sections.append(section)
+                continue
+
+            matched = TASK.match(raw) if index in items else None
+            if matched:
+                parent_line = items[index][1]
+                while parent_line is not None and parent_line not in parsed:
+                    parent_line = items[parent_line][1]
+                parent = parsed.get(parent_line)
+                task = read_task(index, self.lines[index], matched, section, parent)
+                if parent is not None and (not active or active[-1] is not parent):
+                    parent.uncertain_block = task.uncertain_block = True
+                self.tasks.append(task)
+                parsed[index] = task
+                active.append(task)
+            elif active:
+                active[-1].note_lines.append(index)
         for task in self.tasks:
             task.block = "".join(self.lines[task.line : task.end])
             task.notes = self._notes(task)
@@ -555,6 +574,25 @@ class TaskDocument:
             ],
             "tasks": [task.snapshot() for task in self.tasks],
         }
+
+    def changed_occurrence_ids(self, edited: TaskDocument) -> list[str]:
+        def signatures(document: TaskDocument, task_id: str) -> Counter:
+            return Counter(
+                (
+                    task.section.id,
+                    task.section.ambiguous,
+                    digest(task.block),
+                    tuple(source_context(task)),
+                    task.id,
+                )
+                for task in document.by_id.get(task_id, ())
+            )
+
+        return sorted(
+            task_id
+            for task_id in self.by_id.keys() | edited.by_id.keys()
+            if signatures(self, task_id) != signatures(edited, task_id)
+        )
 
     def _show_root(self) -> bool:
         return len(self.sections) == 1 or any(task.section.level == 0 for task in self.tasks)
@@ -610,7 +648,8 @@ class TaskDocument:
     ) -> tuple[Mutation, TaskDocument]:
         result = TaskDocument("".join(lines), self.revision)
         if len(result.tasks) != expected_total or any(
-            index not in result.by_line for index in affected_lines
+            index not in result.by_line or not result.by_line[index].title
+            for index in affected_lines
         ):
             raise DomainError("invalid_command", "This edit changes the Markdown task structure.")
         return Mutation(
@@ -643,6 +682,10 @@ class TaskDocument:
                 "revision_conflict", "The field or task block changed. Refresh and review it."
             )
         if not state["capabilities"][kind]:
+            if task.uncertain_block and kind in {"edit_notes", "move", "delete"}:
+                raise DomainError(
+                    "invalid_command", "Edit this task's ambiguous Markdown list block in Obsidian."
+                )
             if task.ambiguous_descendant and kind in {"move", "delete"}:
                 raise DomainError(
                     "ambiguous_identity", "Resolve duplicate descendant Tasks IDs in Obsidian."
@@ -809,7 +852,7 @@ class TaskDocument:
             if matching_field:
                 tail = matching_field.start
                 continue
-            tag = TAG.search(task.header, task.title_end, tail)
+            tag = TRAILING_TAG.search(task.header, task.title_end, tail)
             if tag is None:
                 break
             tags.append(tag[0])

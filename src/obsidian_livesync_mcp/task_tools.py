@@ -150,6 +150,7 @@ class Receipt(BaseModel):
     predecessor: Revision
     affected: list[Occurrence]
     undo: dict | None
+    changed_ids: list[str] | None = None
 
 
 TASK_TOOLS = {
@@ -173,10 +174,17 @@ def _error(code: str, message: str, **details: object) -> CallToolResult:
     )
 
 
-def _receipt_revision(note: TaskNote, receipt: Receipt) -> str:
+def _revision_history(note: TaskNote) -> list[str]:
     history = note.parent.get("_revisions", {})
     start = history.get("start", 0)
     ancestors = [f"{start - index}-{value}" for index, value in enumerate(history.get("ids", []))]
+    if ancestors and ancestors[0] == note.revision:
+        return ancestors
+    return []
+
+
+def _receipt_revision(note: TaskNote, receipt: Receipt) -> str:
+    ancestors = _revision_history(note)
     if receipt.predecessor in ancestors[1:]:
         return ancestors[ancestors.index(receipt.predecessor) - 1]
     raise TaskError(
@@ -197,6 +205,32 @@ def _receipts(note: TaskNote) -> dict[str, Receipt]:
         raise TaskError(
             "replication_conflict", "The task note's command receipts are invalid."
         ) from exc
+
+
+def _verify_undo_lineage(note: TaskNote, completion: Receipt, receipts: dict[str, Receipt]):
+    revision = _receipt_revision(note, completion)
+    if revision == note.revision:
+        return
+    ids = {reference.id for reference in completion.affected}
+    history = _revision_history(note)
+    predecessors = history[1 : history.index(revision) + 1]
+    by_predecessor: dict[str, list[Receipt]] = {}
+    for receipt in receipts.values():
+        by_predecessor.setdefault(receipt.predecessor, []).append(receipt)
+    if ids and None not in ids:
+        for predecessor in predecessors:
+            matches = by_predecessor.get(predecessor, [])
+            if len(matches) != 1 or matches[0].changed_ids is None:
+                break
+            if ids.intersection(matches[0].changed_ids):
+                break
+        else:
+            return
+    raise TaskError(
+        "revision_conflict",
+        "The completed task or successor changed, or its history could not be verified.",
+        revision=note.revision,
+    )
 
 
 def _affected_tasks(receipt: Receipt, tasks: list[dict]) -> list[dict]:
@@ -302,12 +336,7 @@ class TaskMCP(FastMCP):
                     revision=note.revision,
                     outcome="unknown",
                 )
-            if _receipt_revision(note, completion) != note.revision:
-                raise TaskError(
-                    "revision_conflict",
-                    "The task note changed after this completion. Review the current occurrences.",
-                    revision=note.revision,
-                )
+            _verify_undo_lineage(note, completion, receipts)
             mutation = document.undo(
                 command.base_revision,
                 completion.undo,
@@ -317,6 +346,7 @@ class TaskMCP(FastMCP):
         else:
             mutation = document.apply(args)
 
+        edited = TaskDocument(mutation.content, note.revision)
         receipt = Receipt(
             digest=digest,
             predecessor=note.revision,
@@ -325,6 +355,7 @@ class TaskMCP(FastMCP):
                 for task in mutation.affected_tasks
             ],
             undo=mutation.undo,
+            changed_ids=document.changed_occurrence_ids(edited),
         )
         receipts[command_id] = receipt
         try:
@@ -363,8 +394,15 @@ class TaskMCP(FastMCP):
                     outcome="unknown",
                 )
         except TaskError as exc:
-            exc.details["accepted_revision"] = revision
+            exc.details.update(accepted_revision=revision, outcome="unknown")
             raise
+        except httpx.HTTPError as exc:
+            raise TaskError(
+                "outcome_unknown",
+                "CouchDB accepted the command but could not confirm its current state.",
+                accepted_revision=revision,
+                outcome="unknown",
+            ) from exc
 
         return _result(
             self._success(

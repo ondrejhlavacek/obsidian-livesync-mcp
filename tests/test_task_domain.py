@@ -51,12 +51,12 @@ def test_source_preserving_field_edits_with_mixed_eols_and_distractors():
     )
     document = file(source)
     (task,) = tasks(document)
-    assert task["title"] == "Task #tag"
+    assert task["title"] == "Task"
     assert task["notes"] == "Initial note."
     assert [section["name"] for section in document.snapshot()["sections"]] == ["Inbox", "Empty"]
 
     renamed = document.apply(command(task, "edit_title", title="Reviewed [[note]]"))
-    assert renamed.content == source.replace("Task #tag", "Reviewed [[note]]")
+    assert renamed.content == source.replace("Task #tag", "Reviewed [[note]] #tag")
     rescheduled = document.apply(command(task, "edit_due", due="2030-05-23"))
     assert rescheduled.content == source.replace("2030-04-23", "2030-05-23")
     assert rescheduled.affected_tasks[0]["priority"] == "highest"
@@ -287,3 +287,75 @@ def test_cascade_keeps_ambiguous_and_unsupported_descendants_protected():
         doc.apply(command(parent, "move", section_id=later)).affected_tasks[0]["descendant_count"]
         == 1
     )
+
+
+@pytest.mark.parametrize(
+    ("parent", "child", "sibling"),
+    [
+        ("- [ ] Parent", "  - [ ] Child", " - [ ] Sibling"),
+        ("10. [ ] Parent", "    - [ ] Child", "   - [ ] Sibling"),
+        ("-\t[ ] Parent", "\t- [ ] Child", "   - [ ] Sibling"),
+    ],
+)
+def test_structural_edits_preserve_commonmark_siblings(parent, child, sibling):
+    source = f"## Inbox\n{parent}\n{child}\n{sibling}\n## Later\n"
+    document = file(source)
+    top, nested, peer = tasks(document)
+    assert top["descendant_count"] == 1
+    assert nested["parent_line"] == top["line"]
+    assert peer["parent_line"] is None
+    assert document.apply(command(top, "delete", descendant_count=1)).content == (
+        f"## Inbox\n{sibling}\n## Later\n"
+    )
+    later = document.snapshot()["sections"][1]["id"]
+    assert document.apply(command(top, "move", section_id=later)).content == (
+        f"## Inbox\n{sibling}\n## Later\n{parent}\n{child}\n"
+    )
+    assert document.apply(command(top, "edit_notes", notes="A note")).content.endswith(
+        f"{child}\n{sibling}\n## Later\n"
+    )
+
+
+def test_ambiguous_lazy_list_continuation_blocks_structural_edits():
+    document = file("## Inbox\n- [ ] Parent\nLazy paragraph\n  - [ ] Follow-on child\n## Later")
+    parent, child = tasks(document)
+    assert child["parent_line"] == parent["line"]
+    assert parent["descendant_count"] == 1
+    assert_failure("invalid_command", document.apply, command(parent, "delete", descendant_count=1))
+    assert_failure(
+        "invalid_command", document.apply, command(parent, "edit_notes", notes="New notes")
+    )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "- [ ] Old title #todo",
+        "- [ ] Old title #todo  [id:: example]",
+        "- [ ] Old title  [id:: example] #todo",
+        "- [ ] Old title  [id:: example] #todo  [priority:: highest]  ^block",
+        "- [ ] #todo Old title  [id:: example]",
+    ],
+)
+def test_rename_preserves_global_filter_tag_bytes(header):
+    document = file("## Inbox\n" + header)
+    (task,) = tasks(document)
+    assert task["title"] == "Old title"
+    renamed = document.apply(command(task, "edit_title", title="New title"))
+    assert renamed.content == document.content.replace("Old title", "New title")
+
+
+def test_occurrence_changes_track_ancestry_and_cascades_but_ignore_line_shifts():
+    source = (
+        "- [ ] Parent  [id:: parent]\n  - [x] Child  [id:: child]\n- [ ] Other task  [id:: other]"
+    )
+    original = file(source)
+    assert original.changed_occurrence_ids(file("\n" + source)) == []
+    assert original.changed_occurrence_ids(file(source.replace("Parent", "Renamed"))) == [
+        "child",
+        "parent",
+    ]
+    assert original.changed_occurrence_ids(file(source.replace("Other task", "Renamed"))) == [
+        "other",
+    ]
+    assert original.changed_occurrence_ids(file(source.splitlines()[-1])) == ["child", "parent"]

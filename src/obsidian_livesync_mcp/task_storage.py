@@ -161,6 +161,8 @@ class TaskStorage:
         revision = response.json().get("rev")
         if not isinstance(revision, str):
             raise TaskError(
-                "outcome_unknown", "CouchDB did not return the result of the task publication."
+                "outcome_unknown",
+                "CouchDB did not return the result of the task publication.",
+                outcome="unknown",
             )
         return revision
