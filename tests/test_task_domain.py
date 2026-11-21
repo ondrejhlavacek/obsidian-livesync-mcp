@@ -72,6 +72,7 @@ def test_nested_completion_move_delete_and_notes_round_trip():
         "  First note\n"
         "  - [ ] Child  [id:: child]\n"
         "    Child's notes\n"
+        "\n"
         "  More parent notes\n"
         "  - [x] Sibling\n"
         "\n"
@@ -95,7 +96,7 @@ def test_nested_completion_move_delete_and_notes_round_trip():
     assert completed_document.undo("2-cafe", undo, undo["completed"], None).content == source
 
     edited = document.apply(command(parent, "edit_notes", notes="New line\n\nNew paragraph"))
-    assert "  - [ ] Child  [id:: child]\n    Child's notes\n  - [x] Sibling\n" in edited.content
+    assert "  - [ ] Child  [id:: child]\n    Child's notes\n\n  - [x] Sibling\n" in edited.content
     assert edited.affected_tasks[0]["notes"] == "New line\n\nNew paragraph"
     assert_failure(
         "invalid_command", document.apply, command(parent, "edit_notes", notes="- [ ] New child")
@@ -108,6 +109,7 @@ def test_nested_completion_move_delete_and_notes_round_trip():
         "  First note\n"
         "  - [ ] Child  [id:: child]\n"
         "    Child's notes\n"
+        "\n"
         "  More parent notes\n"
         "  - [x] Sibling\n"
         "- [ ] Another task"
@@ -361,19 +363,35 @@ def test_occurrence_changes_track_ancestry_and_cascades_but_ignore_line_shifts()
     assert original.changed_occurrence_ids(file(source.splitlines()[-1])) == ["child", "parent"]
 
 
-def test_ambiguous_list_with_no_descendants_cannot_transfer_prose_to_preceding_task():
+@pytest.mark.parametrize(
+    "residual",
+    [
+        "Lazy continuation\n- [ ] Following [id:: following]",
+        "Lazy continuation\n  Indented tail\n- [ ] Following [id:: following]",
+        "First lazy line\nSecond lazy line\n- [ ] Following [id:: following]",
+        "Terminal lazy line",
+    ],
+)
+def test_ambiguous_list_with_no_descendants_preserves_residual_prose(residual):
     document = file(
+        "## Later\n"
+        "## Inbox\n"
         "- [ ] Previous [id:: previous]\n"
         "- [ ] Target [id:: target]\n"
-        "  Opening note under target\n"
-        "Lazy continuation\n"
-        "  Indented tail\n"
-        "- [ ] Following [id:: following]"
+        "  Opening note under target\n" + residual
     )
-    _, target, _ = tasks(document)
+    target = tasks(document)[1]
+    later = document.snapshot()["sections"][0]["id"]
     assert target["descendant_count"] == 0
-    assert not target["capabilities"]["delete"]
-    assert_failure("invalid_command", document.apply, command(target, "delete", descendant_count=0))
+    for kind, changes in [
+        ("delete", {"descendant_count": 0}),
+        ("move", {"section_id": later}),
+        ("edit_notes", {"notes": "Replacement notes"}),
+    ]:
+        assert not target["capabilities"][kind]
+        assert_failure("invalid_command", document.apply, command(target, kind, **changes))
+    renamed = document.apply(command(target, "edit_title", title="Renamed"))
+    assert renamed.content == document.content.replace("Target", "Renamed")
 
 
 def test_rename_requires_preserving_exact_inline_filter_tag():

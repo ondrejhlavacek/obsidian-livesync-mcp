@@ -517,11 +517,7 @@ class TaskDocument:
                 index >= items[active[-1].line][0] or indent < active[-1].note_indent
             ):
                 task = active.pop()
-                if any(
-                    line.strip() and indentation(line) >= task.note_indent
-                    for line in self.lines[index : items[task.line][0]]
-                ):
-                    task.uncertain_block = True
+                task.uncertain_block |= index < items[task.line][0]
             for owner in active:
                 owner.end = index + 1
 
