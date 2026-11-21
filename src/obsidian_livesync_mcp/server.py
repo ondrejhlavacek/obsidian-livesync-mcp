@@ -19,6 +19,17 @@ from .utils import validate_vault_path
 logger = logging.getLogger(__name__)
 
 _transport = os.environ.get("MCP_TRANSPORT", "stdio")
+_task_note = os.environ.get("MCP_TASK_NOTE")
+if _task_note is not None:
+    validate_vault_path(_task_note)
+    if not _task_note.lower().endswith(".md"):
+        raise ValueError("MCP_TASK_NOTE must identify an existing Markdown note.")
+    if (
+        _transport == "streamable-http"
+        and not os.environ.get("MCP_API_KEY")
+        and not os.environ.get("OAUTH_ISSUER_URL")
+    ):
+        raise ValueError("Task MCP over HTTP requires MCP_API_KEY or OIDC authentication.")
 _server_kwargs: dict = {}
 _oauth_provider = None
 _oauth_store = None
@@ -88,10 +99,28 @@ if _transport == "streamable-http":
             required_scopes=[],
         )
 
-mcp = FastMCP("obsidian-livesync-mcp", **_server_kwargs)
+
+def _task_client() -> ObsidianVaultClient:
+    return _get_client()
+
+
+if _task_note is not None:
+    from .task_tools import TaskMCP
+
+    mcp = TaskMCP(_task_note, _task_client, **_server_kwargs)
+else:
+    mcp = FastMCP("obsidian-livesync-mcp", **_server_kwargs)
+
+
+def _vault_tool():
+    if _task_note is None:
+        return mcp.tool()
+    return lambda func: func
+
+
 _link_store = EphemeralLinkStore()
 
-if _transport == "streamable-http":
+if _transport == "streamable-http" and _task_note is None:
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -151,7 +180,7 @@ def _tool_error_handler(func):
     return wrapper
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def list_notes(folder: str | None = None, limit: int = 50, skip: int = 0) -> str:
     """List notes in the Obsidian vault with metadata.
@@ -169,7 +198,7 @@ async def list_notes(folder: str | None = None, limit: int = 50, skip: int = 0) 
     return f"Found {len(notes)} notes:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def get_file_info(path: str, inline_budget_bytes: int | None = None) -> str:
     """Inspect a note or attachment without fetching chunk content.
@@ -189,7 +218,7 @@ async def get_file_info(path: str, inline_budget_bytes: int | None = None) -> st
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def read_note(path: str, max_bytes: int = 1_000_000) -> str:
     """Read the full content of a note from the Obsidian vault.
@@ -219,7 +248,7 @@ async def read_note(path: str, max_bytes: int = 1_000_000) -> str:
     return note.content
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def read_note_range(path: str, offset: int, length: int) -> str:
     """Read a character range from a text note.
@@ -240,7 +269,7 @@ async def read_note_range(path: str, offset: int, length: int) -> str:
     )
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def write_note(path: str, content: str) -> str:
     """Create or update a note in the Obsidian vault.
@@ -254,7 +283,7 @@ async def write_note(path: str, content: str) -> str:
     return f"Written: {path} ({len(content.encode('utf-8'))} bytes)"
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def search_notes(query: str, folder: str | None = None, limit: int = 20) -> str:
     """Search note content in the Obsidian vault.
@@ -276,7 +305,7 @@ async def search_notes(query: str, folder: str | None = None, limit: int = 20) -
     return f"Found matches in {len(results)} notes:" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def append_note(path: str, content: str) -> str:
     """Append content to an existing note in the Obsidian vault.
@@ -290,7 +319,7 @@ async def append_note(path: str, content: str) -> str:
     return f"Appended to: {path}"
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def delete_note(path: str, hard: bool = False) -> str:
     """Delete a note from the Obsidian vault.
@@ -316,7 +345,7 @@ async def delete_note(path: str, hard: bool = False) -> str:
     return f"Deleted: {path}" + (" (hard)" if hard else "")
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def read_frontmatter(path: str) -> str:
     """Read frontmatter properties from a note.
@@ -332,7 +361,7 @@ async def read_frontmatter(path: str) -> str:
     return f"Frontmatter for {path}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def update_frontmatter(path: str, properties_json: str) -> str:
     """Update or set frontmatter properties on a note.
@@ -355,7 +384,7 @@ async def update_frontmatter(path: str, properties_json: str) -> str:
     return f"Updated frontmatter for: {path}"
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def list_tags(folder: str | None = None) -> str:
     """List all tags in the vault with occurrence counts.
@@ -371,7 +400,7 @@ async def list_tags(folder: str | None = None) -> str:
     return f"Found {len(tags)} tags:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def search_by_tag(tag: str, folder: str | None = None, limit: int = 20) -> str:
     """Find notes containing a specific tag.
@@ -389,7 +418,7 @@ async def search_by_tag(tag: str, folder: str | None = None, limit: int = 20) ->
     return f"Found {len(notes)} notes with #{tag}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def get_backlinks(path: str) -> str:
     """Find notes that link to this note via wikilinks.
@@ -408,7 +437,7 @@ async def get_backlinks(path: str) -> str:
     return f"Found {len(backlinks)} backlinks for {path}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def get_outbound_links(path: str) -> str:
     """List wikilinks from a note (outbound links).
@@ -424,7 +453,7 @@ async def get_outbound_links(path: str) -> str:
     return f"Found {len(links)} outbound links in {path}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def list_folders() -> str:
     """List all folders in the Obsidian vault with note counts."""
@@ -436,7 +465,7 @@ async def list_folders() -> str:
     return f"Found {len(folders)} folders:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def add_attachment(path: str, data_base64: str) -> str:
     """Add or replace a binary attachment in the vault.
@@ -457,7 +486,7 @@ async def add_attachment(path: str, data_base64: str) -> str:
     return f"Added attachment: {path} ({len(data)} bytes)"
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def get_attachment(path: str, max_bytes: int = 10_485_760) -> str:
     """Download a binary attachment as base64.
@@ -492,7 +521,7 @@ async def get_attachment(path: str, max_bytes: int = 10_485_760) -> str:
     return f"{path} ({att.size} bytes, {att.content_type})\nbase64:\n{data_base64}"
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def get_attachment_range(
     path: str,
@@ -526,7 +555,7 @@ async def get_attachment_range(
     )
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def list_attachments(folder: str | None = None, limit: int = 100, skip: int = 0) -> str:
     """List binary attachments in the vault.
@@ -544,7 +573,7 @@ async def list_attachments(folder: str | None = None, limit: int = 100, skip: in
     return f"Found {len(attachments)} attachments:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def create_download_url(path: str, ttl_seconds: int | None = None) -> str:
     """Create an ephemeral HTTP download URL for a note or attachment.
@@ -578,7 +607,7 @@ async def create_download_url(path: str, ttl_seconds: int | None = None) -> str:
     )
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def create_upload_url(
     path: str,
@@ -619,7 +648,7 @@ async def create_upload_url(
     )
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def remove_attachment(path: str, force: bool = False, hard: bool = False) -> str:
     """Remove a binary attachment from the vault.
@@ -644,7 +673,7 @@ async def remove_attachment(path: str, force: bool = False, hard: bool = False) 
     return f"Removed attachment: {path}" + (" (hard)" if hard else "")
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def find_attachment_embeds(path: str) -> str:
     """Find notes that embed or link to an attachment.
@@ -663,7 +692,7 @@ async def find_attachment_embeds(path: str) -> str:
     return f"{len(embeds)} note(s) reference {path}:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def find_orphan_attachments(folder: str | None = None) -> str:
     """List attachments that no note embeds or links to.
@@ -679,7 +708,7 @@ async def find_orphan_attachments(folder: str | None = None) -> str:
     return f"Found {len(orphans)} orphan attachments:\n" + "\n".join(lines)
 
 
-@mcp.tool()
+@_vault_tool()
 @_tool_error_handler
 async def move_attachment(old_path: str, new_path: str, rewrite_links: bool = True) -> str:
     """Move/rename an attachment and rewrite references in notes.

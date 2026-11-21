@@ -120,13 +120,13 @@ class ObsidianVaultClient(AttachmentOps):
             obfuscate_passphrase=self.config.obfuscate_passphrase,
         )
 
-    async def _get_doc(self, path: str) -> dict | None:
+    async def _get_doc(self, path: str, *, params: dict[str, str] | None = None) -> dict | None:
         """Fetch a doc by vault path, trying both ID conventions."""
         client = await self._get_client()
         doc_id = self._doc_id(path)
 
         # Try normalized ID first (handles '_' prefix → '/_' automatically)
-        resp = await client.get(f"/{encode_doc_id(doc_id)}")
+        resp = await client.get(f"/{encode_doc_id(doc_id)}", params=params)
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code != 404:
@@ -134,7 +134,7 @@ class ObsidianVaultClient(AttachmentOps):
 
         # Try alternate convention (with/without leading slash)
         alt_id = "/" + doc_id if not doc_id.startswith("/") else doc_id[1:]
-        resp = await client.get(f"/{encode_doc_id(alt_id)}")
+        resp = await client.get(f"/{encode_doc_id(alt_id)}", params=params)
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code != 404:
