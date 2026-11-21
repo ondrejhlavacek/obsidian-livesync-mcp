@@ -114,7 +114,8 @@ Configure the CouchDB environment variables above before starting the server. Ta
 requires a plain-text LiveSync note using supported content-addressed chunks. Select Tasks'
 Dataview format in Obsidian. If the vault's Tasks global filter requires a tag, include that
 tag in new task titles. Existing leading and trailing tags, including those interleaved
-with fields, are preserved when a task is renamed. The only supported completion recurrence
+with fields, are preserved when a task is renamed. Include existing inline tags in the new
+title to specify their placement. The only supported completion recurrence
 is `every month on the 23rd` with a compatible due date and no additional scheduling behavior
 or nested content. Tasks with indeterminate list boundaries require editing in Obsidian.
 

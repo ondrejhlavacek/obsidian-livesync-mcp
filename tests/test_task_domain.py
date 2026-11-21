@@ -359,3 +359,28 @@ def test_occurrence_changes_track_ancestry_and_cascades_but_ignore_line_shifts()
         "other",
     ]
     assert original.changed_occurrence_ids(file(source.splitlines()[-1])) == ["child", "parent"]
+
+
+def test_ambiguous_list_with_no_descendants_cannot_transfer_prose_to_preceding_task():
+    document = file(
+        "- [ ] Previous [id:: previous]\n"
+        "- [ ] Target [id:: target]\n"
+        "  Opening note under target\n"
+        "Lazy continuation\n"
+        "  Indented tail\n"
+        "- [ ] Following [id:: following]"
+    )
+    _, target, _ = tasks(document)
+    assert target["descendant_count"] == 0
+    assert not target["capabilities"]["delete"]
+    assert_failure("invalid_command", document.apply, command(target, "delete", descendant_count=0))
+
+
+def test_rename_requires_preserving_exact_inline_filter_tag():
+    source = "- [ ] Pay #todo electricity  [id:: bills]"
+    document = file(source)
+    (task,) = tasks(document)
+    for title in ("Pay electricity invoice", "Pay #todo-later electricity invoice"):
+        assert_failure("invalid_command", document.apply, command(task, "edit_title", title=title))
+    rename = document.apply(command(task, "edit_title", title="Pay #todo electricity invoice"))
+    assert rename.content == "- [ ] Pay #todo electricity invoice  [id:: bills]"

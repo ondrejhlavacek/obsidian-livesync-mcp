@@ -47,8 +47,10 @@ TASK = re.compile(
 HEADING = re.compile(r"^ {0,3}(?P<marker>#{1,6})(?:[ \t]+|$)(?P<title>.*)$")
 MARKDOWN = MarkdownIt("commonmark")
 BLOCK_LINK = re.compile(r"[ \t]+\^[a-zA-Z0-9-]+$")
-TRAILING_TAG = re.compile(r"[ \t]+#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t`]+$")
-LEADING_TAGS = re.compile(r"([ \t]+#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t`]+)+[ \t]+")
+TAG_TEXT = r"#[^ !@#$%^&*(),.?\x22:|<>\[\]()\t`]+"
+TRAILING_TAG = re.compile(rf"[ \t]+{TAG_TEXT}$")
+LEADING_TAGS = re.compile(rf"(?:[ \t]+{TAG_TEXT})+[ \t]+")
+INLINE_TAG = re.compile(TAG_TEXT)
 LINE_BREAK = re.compile(r"\r\n|\n|\r")
 END_LINE = re.compile(r"(?:\r\n|\n|\r)$")
 ID_VALUE = {
@@ -265,7 +267,9 @@ class Task:
             "edit_due": recurring_edit,
             "move": editable and not (self.ambiguous_descendant or self.uncertain_block),
             "delete": recurring_edit
-            and not (self.ambiguous_descendant or self.unsupported_descendant),
+            and not (
+                self.ambiguous_descendant or self.unsupported_descendant or self.uncertain_block
+            ),
             "assign_id": editable and self.id is None,
         }
 
@@ -716,6 +720,10 @@ class TaskDocument:
             header = task.edit_field("id", operation["id"])
         elif kind == "edit_title":
             value = check_title(operation["title"])
+            if Counter(INLINE_TAG.findall(task.title)) - Counter(INLINE_TAG.findall(value)):
+                raise DomainError(
+                    "invalid_command", "Keep the existing inline tags in the task title."
+                )
             header = task.header[: task.title_start] + value + task.header[task.title_end :]
         elif kind == "set_priority":
             header = task.edit_field("priority", check_priority(operation["priority"]))
