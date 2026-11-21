@@ -576,3 +576,59 @@ async def test_get_attachment_tool_size_guard():
     fake.read_attachment.assert_not_awaited()
     assert "max_bytes" in result
     assert "image/png" in result
+
+
+def test_task_mode_requires_authentication_for_http():
+    try:
+        with pytest.raises(ValueError, match="requires MCP_API_KEY or OIDC authentication"):
+            _reload_server_module(
+                {
+                    "MCP_TRANSPORT": "streamable-http",
+                    "MCP_TASK_NOTE": "Inbox.md",
+                    "MCP_API_KEY": "",
+                    "OAUTH_ISSUER_URL": "",
+                }
+            )
+    finally:
+        _reload_server_module({"MCP_TRANSPORT": "stdio"})
+
+
+def test_task_mode_restricts_http_tools_and_routes():
+    mod = _reload_server_module(
+        {
+            "MCP_TRANSPORT": "streamable-http",
+            "MCP_TASK_NOTE": "Inbox.md",
+            "MCP_API_KEY": "synthetic-test-token",
+            "OAUTH_ISSUER_URL": "",
+        }
+    )
+    headers = _MCP_HEADERS | {"Authorization": "Bearer synthetic-test-token"}
+    try:
+        with TestClient(mod.mcp.streamable_http_app()) as client:
+            assert client.post("/mcp", json=_INIT_REQUEST, headers=_MCP_HEADERS).status_code == 401
+            assert client.post("/mcp", json=_INIT_REQUEST, headers=headers).status_code == 200
+            tools = client.post("/mcp", json=_TOOLS_LIST_REQUEST, headers=headers)
+            assert {tool["name"] for tool in tools.json()["result"]["tools"]} == {
+                "get_task_snapshot",
+                "apply_task_command",
+                "undo_completion",
+            }
+            assert client.get("/download/token", headers=headers).status_code == 404
+            assert client.put("/upload/token", headers=headers).status_code == 404
+
+            for name, code in [
+                ("read_note", "forbidden"),
+                ("get_task_snapshot", "invalid_command"),
+            ]:
+                params = {"name": name, "arguments": {"path": "Other.md"}}
+                response = client.post(
+                    "/mcp",
+                    json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": params},
+                    headers=headers,
+                )
+                assert response.status_code == 200
+                result = response.json()["result"]
+                assert result["isError"]
+                assert result["structuredContent"]["code"] == code
+    finally:
+        _reload_server_module({"MCP_TRANSPORT": "stdio"})
